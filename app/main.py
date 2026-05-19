@@ -354,6 +354,9 @@ def create_intake(request: IntakeRequest):
         return {
             "status": "needs_selection",
             "service_type": service_type,
+            "industry": service["industry"],
+            "duration_minutes": service["duration_minutes"],
+            "priority": service["priority"],
             "available_options": options,
         }
 
@@ -369,6 +372,10 @@ def create_intake(request: IntakeRequest):
             options = find_available_options(duration_minutes)
         return {
             "status": "slot_unavailable",
+            "service_type": service_type,
+            "industry": service["industry"],
+            "duration_minutes": service["duration_minutes"],
+            "priority": service["priority"],
             "available_options": options,
         }
 
@@ -408,6 +415,10 @@ def create_intake(request: IntakeRequest):
 
         return {
             "status": status,
+            "service_type": service_type,
+            "industry": service["industry"],
+            "duration_minutes": service["duration_minutes"],
+            "priority": service["priority"],
             "scheduled_time": scheduled_time,
             "scheduling_note": scheduling_note,
             "data": record,
@@ -415,6 +426,10 @@ def create_intake(request: IntakeRequest):
     except Exception as e:
         return {
             "status": "error",
+            "service_type": service_type,
+            "industry": service["industry"],
+            "duration_minutes": service["duration_minutes"],
+            "priority": service["priority"],
             "message": f"Failed to create intake: {str(e)}",
         }
 
