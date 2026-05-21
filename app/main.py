@@ -40,6 +40,22 @@ SERVICES = {
     "consultation": {"industry": "salon", "duration_minutes": 30, "priority": "low"},
 }
 
+VALID_APPOINTMENT_STATUSES = {
+    "pending",
+    "scheduled",
+    "confirmed",
+    "checked_in",
+    "completed",
+    "cancelled",
+    "no_show",
+}
+
+ALLOWED_INTAKE_FILTER_FIELDS = {
+    "appointment_status",
+    "service_type",
+    "priority",
+}
+
 
 def normalize_time_value(value):
     if value is None:
@@ -314,6 +330,25 @@ def record_from_tuple(row):
     }
 
 
+def fetch_intakes_by_field(field_name, value):
+    if field_name not in ALLOWED_INTAKE_FILTER_FIELDS:
+        raise ValueError("Invalid intake filter field")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"""
+        SELECT id, name, phone, email, reason, preferred_time, source, scheduled_time, appointment_status, service_type, industry, duration_minutes, priority, created_at
+        FROM intake_requests
+        WHERE {field_name} = %s
+        ORDER BY created_at DESC
+    """, (value,))
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    return [record_from_tuple(row) for row in rows]
+
+
 
 
 @app.get("/")
@@ -491,6 +526,66 @@ def list_intakes():
         }
 
 
+@app.get("/intakes/status/{status}")
+def list_intakes_by_status(status: str):
+    if status not in VALID_APPOINTMENT_STATUSES:
+        return {
+            "status": "error",
+            "message": "Invalid appointment status",
+        }
+
+    try:
+        records = fetch_intakes_by_field("appointment_status", status)
+        return {
+            "status": "ok",
+            "filter": "status",
+            "value": status,
+            "count": len(records),
+            "data": records,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Failed to fetch intakes: {str(e)}",
+        }
+
+
+@app.get("/intakes/service/{service_type}")
+def list_intakes_by_service(service_type: str):
+    try:
+        records = fetch_intakes_by_field("service_type", service_type)
+        return {
+            "status": "ok",
+            "filter": "service_type",
+            "value": service_type,
+            "count": len(records),
+            "data": records,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Failed to fetch intakes: {str(e)}",
+        }
+
+
+@app.get("/intakes/priority/{priority}")
+def list_intakes_by_priority(priority: str):
+    try:
+        records = fetch_intakes_by_field("priority", priority)
+        return {
+            "status": "ok",
+            "filter": "priority",
+            "value": priority,
+            "count": len(records),
+            "data": records,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Failed to fetch intakes: {str(e)}",
+        }
+
+
 @app.get("/intakes/{request_id}")
 def get_intake(request_id: int):
     try:
@@ -524,8 +619,7 @@ def get_intake(request_id: int):
 
 @app.put("/intakes/{request_id}/status")
 def update_intake_status(request_id: int, update: StatusUpdate):
-    valid_statuses = {"pending", "scheduled", "completed", "cancelled"}
-    if update.appointment_status not in valid_statuses:
+    if update.appointment_status not in VALID_APPOINTMENT_STATUSES:
         return {
             "status": "error",
             "message": "Invalid appointment status",
