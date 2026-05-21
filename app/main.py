@@ -1,6 +1,6 @@
 import os
 import psycopg2
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 
@@ -349,6 +349,18 @@ def fetch_intakes_by_field(field_name, value):
     return [record_from_tuple(row) for row in rows]
 
 
+def require_admin_auth(authorization: Optional[str] = Header(None)):
+    expected_token = os.getenv("ADMIN_API_TOKEN")
+    if not expected_token:
+        raise HTTPException(status_code=500, detail="ADMIN_API_TOKEN is not configured")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid authorization header")
+    token = authorization.replace("Bearer ", "", 1).strip()
+    if token != expected_token:
+        raise HTTPException(status_code=403, detail="Invalid admin token")
+    return True
+
+
 
 
 @app.get("/")
@@ -368,8 +380,69 @@ def health_check():
     }
 
 
+@app.get("/dashboard/stats")
+def dashboard_stats(admin_auth: bool = Depends(require_admin_auth)):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT COUNT(*) FROM intake_requests")
+        total_intakes = cursor.fetchone()[0]
+
+        by_status = {
+            status: 0
+            for status in VALID_APPOINTMENT_STATUSES
+        }
+        cursor.execute("""
+            SELECT appointment_status, COUNT(*)
+            FROM intake_requests
+            GROUP BY appointment_status
+        """)
+        for status, count in cursor.fetchall():
+            if status in by_status:
+                by_status[status] = count
+
+        cursor.execute("""
+            SELECT service_type, COUNT(*)
+            FROM intake_requests
+            WHERE service_type IS NOT NULL
+            GROUP BY service_type
+        """)
+        by_service_type = {
+            service_type: count
+            for service_type, count in cursor.fetchall()
+        }
+
+        cursor.execute("""
+            SELECT priority, COUNT(*)
+            FROM intake_requests
+            WHERE priority IS NOT NULL
+            GROUP BY priority
+        """)
+        by_priority = {
+            priority: count
+            for priority, count in cursor.fetchall()
+        }
+
+        cursor.close()
+        conn.close()
+
+        return {
+            "status": "ok",
+            "total_intakes": total_intakes,
+            "by_status": by_status,
+            "by_service_type": by_service_type,
+            "by_priority": by_priority,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Failed to fetch dashboard stats: {str(e)}",
+        }
+
+
 @app.get("/debug/database-url")
-def debug_database_url():
+def debug_database_url(admin_auth: bool = Depends(require_admin_auth)):
     database_url = os.getenv("DATABASE_URL")
     return {
         "database_url_set": bool(database_url),
@@ -500,7 +573,7 @@ def get_availability(request: AvailabilityRequest):
 
 
 @app.get("/intakes")
-def list_intakes():
+def list_intakes(admin_auth: bool = Depends(require_admin_auth)):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -527,7 +600,7 @@ def list_intakes():
 
 
 @app.get("/intakes/status/{status}")
-def list_intakes_by_status(status: str):
+def list_intakes_by_status(status: str, admin_auth: bool = Depends(require_admin_auth)):
     if status not in VALID_APPOINTMENT_STATUSES:
         return {
             "status": "error",
@@ -551,7 +624,7 @@ def list_intakes_by_status(status: str):
 
 
 @app.get("/intakes/service/{service_type}")
-def list_intakes_by_service(service_type: str):
+def list_intakes_by_service(service_type: str, admin_auth: bool = Depends(require_admin_auth)):
     try:
         records = fetch_intakes_by_field("service_type", service_type)
         return {
@@ -569,7 +642,7 @@ def list_intakes_by_service(service_type: str):
 
 
 @app.get("/intakes/priority/{priority}")
-def list_intakes_by_priority(priority: str):
+def list_intakes_by_priority(priority: str, admin_auth: bool = Depends(require_admin_auth)):
     try:
         records = fetch_intakes_by_field("priority", priority)
         return {
@@ -587,7 +660,7 @@ def list_intakes_by_priority(priority: str):
 
 
 @app.get("/intakes/{request_id}")
-def get_intake(request_id: int):
+def get_intake(request_id: int, admin_auth: bool = Depends(require_admin_auth)):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -635,7 +708,7 @@ def update_intake_status(request_id, status):
 
 
 @app.put("/intakes/{request_id}/status")
-def update_intake_status_endpoint(request_id: int, update: StatusUpdate):
+def update_intake_status_endpoint(request_id: int, update: StatusUpdate, admin_auth: bool = Depends(require_admin_auth)):
     if update.appointment_status not in VALID_APPOINTMENT_STATUSES:
         return {
             "status": "error",
@@ -662,7 +735,7 @@ def update_intake_status_endpoint(request_id: int, update: StatusUpdate):
 
 
 @app.delete("/intakes/{request_id}")
-def delete_intake(request_id: int):
+def delete_intake(request_id: int, admin_auth: bool = Depends(require_admin_auth)):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
