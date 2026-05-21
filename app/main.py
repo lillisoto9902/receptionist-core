@@ -617,8 +617,25 @@ def get_intake(request_id: int):
         }
 
 
+def update_intake_status(request_id, status):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE intake_requests
+        SET appointment_status = %s
+        WHERE id = %s
+        RETURNING id, name, phone, email, reason, preferred_time, source, scheduled_time, appointment_status, service_type, industry, duration_minutes, priority, created_at
+    """, (status, request_id))
+    row = cursor.fetchone()
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    return record_from_tuple(row)
+
+
 @app.put("/intakes/{request_id}/status")
-def update_intake_status(request_id: int, update: StatusUpdate):
+def update_intake_status_endpoint(request_id: int, update: StatusUpdate):
     if update.appointment_status not in VALID_APPOINTMENT_STATUSES:
         return {
             "status": "error",
@@ -626,23 +643,11 @@ def update_intake_status(request_id: int, update: StatusUpdate):
         }
 
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            UPDATE intake_requests
-            SET appointment_status = %s
-            WHERE id = %s
-            RETURNING id, name, phone, email, reason, preferred_time, source, scheduled_time, appointment_status, service_type, industry, duration_minutes, priority, created_at
-        """, (update.appointment_status, request_id))
-        row = cursor.fetchone()
-        conn.commit()
-        cursor.close()
-        conn.close()
-        
-        if row:
-            record = record_from_tuple(row)
+        record = update_intake_status(request_id, update.appointment_status)
+        if record:
             return {
-                "status": "updated",
+                "status": "ok",
+                "message": "Appointment status updated",
                 "data": record,
             }
         return {
