@@ -1,6 +1,7 @@
 import os
 import psycopg2
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional
 
@@ -439,6 +440,377 @@ def dashboard_stats(admin_auth: bool = Depends(require_admin_auth)):
             "status": "error",
             "message": f"Failed to fetch dashboard stats: {str(e)}",
         }
+
+
+@app.get("/admin/dashboard/demo", response_class=HTMLResponse)
+def admin_dashboard_demo():
+    return """
+    <!doctype html>
+    <html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Receptionist Core Admin Dashboard</title>
+        <style>
+            :root {
+                color-scheme: light;
+                --background: #f6f8fb;
+                --surface: #ffffff;
+                --surface-muted: #eef3f8;
+                --border: #dbe3ec;
+                --text: #172033;
+                --muted: #637083;
+                --accent: #2563eb;
+                --accent-soft: #dbeafe;
+                --success: #0f766e;
+                --warning: #b45309;
+                --danger: #be123c;
+                --shadow: 0 18px 45px rgba(15, 23, 42, 0.08);
+            }
+
+            * {
+                box-sizing: border-box;
+            }
+
+            body {
+                margin: 0;
+                background: var(--background);
+                color: var(--text);
+                font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                line-height: 1.5;
+            }
+
+            .page {
+                width: min(1180px, calc(100% - 40px));
+                margin: 0 auto;
+                padding: 42px 0 28px;
+            }
+
+            header {
+                display: flex;
+                align-items: flex-start;
+                justify-content: space-between;
+                gap: 24px;
+                margin-bottom: 28px;
+            }
+
+            .eyebrow {
+                margin: 0 0 8px;
+                color: var(--accent);
+                font-size: 0.78rem;
+                font-weight: 800;
+                letter-spacing: 0;
+                text-transform: uppercase;
+            }
+
+            h1 {
+                margin: 0;
+                font-size: clamp(2rem, 4vw, 3.15rem);
+                line-height: 1.05;
+                letter-spacing: 0;
+            }
+
+            .subtitle {
+                max-width: 640px;
+                margin: 12px 0 0;
+                color: var(--muted);
+                font-size: 1rem;
+            }
+
+            .status-pill {
+                flex: 0 0 auto;
+                margin-top: 4px;
+                border: 1px solid var(--border);
+                border-radius: 999px;
+                background: var(--surface);
+                color: var(--success);
+                padding: 10px 14px;
+                font-size: 0.88rem;
+                font-weight: 700;
+                box-shadow: 0 8px 22px rgba(15, 23, 42, 0.05);
+            }
+
+            .metrics-grid {
+                display: grid;
+                grid-template-columns: repeat(4, minmax(0, 1fr));
+                gap: 16px;
+                margin-bottom: 18px;
+            }
+
+            .card {
+                border: 1px solid var(--border);
+                border-radius: 18px;
+                background: var(--surface);
+                box-shadow: var(--shadow);
+            }
+
+            .metric {
+                padding: 22px;
+                min-height: 132px;
+            }
+
+            .metric-label {
+                margin: 0;
+                color: var(--muted);
+                font-size: 0.86rem;
+                font-weight: 700;
+            }
+
+            .metric-value {
+                margin: 12px 0 4px;
+                font-size: 2.55rem;
+                font-weight: 800;
+                line-height: 1;
+            }
+
+            .metric-note {
+                margin: 0;
+                color: var(--muted);
+                font-size: 0.84rem;
+            }
+
+            .total-card {
+                grid-column: span 2;
+                background: linear-gradient(135deg, #ffffff 0%, #eef6ff 100%);
+            }
+
+            .content-grid {
+                display: grid;
+                grid-template-columns: 1.2fr 0.8fr;
+                gap: 18px;
+            }
+
+            .panel {
+                padding: 24px;
+            }
+
+            .panel-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 16px;
+                margin-bottom: 18px;
+            }
+
+            h2 {
+                margin: 0;
+                font-size: 1.1rem;
+                letter-spacing: 0;
+            }
+
+            .panel-kicker {
+                margin: 0;
+                color: var(--muted);
+                font-size: 0.86rem;
+                font-weight: 700;
+            }
+
+            .list {
+                display: grid;
+                gap: 12px;
+            }
+
+            .row {
+                display: grid;
+                grid-template-columns: minmax(120px, 1fr) auto;
+                align-items: center;
+                gap: 14px;
+            }
+
+            .row-label {
+                color: var(--text);
+                font-weight: 700;
+            }
+
+            .row-value {
+                color: var(--text);
+                font-weight: 800;
+            }
+
+            .bar {
+                grid-column: 1 / -1;
+                height: 9px;
+                overflow: hidden;
+                border-radius: 999px;
+                background: var(--surface-muted);
+            }
+
+            .bar span {
+                display: block;
+                height: 100%;
+                border-radius: inherit;
+                background: var(--accent);
+            }
+
+            .bar .success {
+                background: var(--success);
+            }
+
+            .bar .warning {
+                background: var(--warning);
+            }
+
+            .bar .danger {
+                background: var(--danger);
+            }
+
+            footer {
+                margin-top: 26px;
+                color: var(--muted);
+                font-size: 0.9rem;
+                text-align: center;
+            }
+
+            @media (max-width: 880px) {
+                header,
+                .content-grid {
+                    grid-template-columns: 1fr;
+                }
+
+                header {
+                    display: block;
+                }
+
+                .status-pill {
+                    display: inline-flex;
+                    margin-top: 18px;
+                }
+
+                .metrics-grid {
+                    grid-template-columns: repeat(2, minmax(0, 1fr));
+                }
+            }
+
+            @media (max-width: 560px) {
+                .page {
+                    width: min(100% - 28px, 1180px);
+                    padding-top: 28px;
+                }
+
+                .metrics-grid {
+                    grid-template-columns: 1fr;
+                }
+
+                .total-card {
+                    grid-column: span 1;
+                }
+
+                .metric,
+                .panel {
+                    padding: 18px;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <main class="page">
+            <header>
+                <div>
+                    <p class="eyebrow">Demo Admin</p>
+                    <h1>Receptionist Core Admin Dashboard</h1>
+                    <p class="subtitle">Portfolio-ready operational snapshot using hardcoded sample data for intake, scheduling, and workflow visibility.</p>
+                </div>
+                <div class="status-pill">Demo data only</div>
+            </header>
+
+            <section class="metrics-grid" aria-label="Dashboard totals">
+                <article class="card metric total-card">
+                    <p class="metric-label">Total Intakes</p>
+                    <p class="metric-value">12</p>
+                    <p class="metric-note">Sample requests across active workflows</p>
+                </article>
+                <article class="card metric">
+                    <p class="metric-label">Scheduled</p>
+                    <p class="metric-value">5</p>
+                    <p class="metric-note">Appointments assigned</p>
+                </article>
+                <article class="card metric">
+                    <p class="metric-label">Confirmed</p>
+                    <p class="metric-value">3</p>
+                    <p class="metric-note">Clients confirmed</p>
+                </article>
+                <article class="card metric">
+                    <p class="metric-label">Checked In</p>
+                    <p class="metric-value">1</p>
+                    <p class="metric-note">Currently active</p>
+                </article>
+                <article class="card metric">
+                    <p class="metric-label">Completed</p>
+                    <p class="metric-value">2</p>
+                    <p class="metric-note">Finished visits</p>
+                </article>
+                <article class="card metric">
+                    <p class="metric-label">Cancelled</p>
+                    <p class="metric-value">1</p>
+                    <p class="metric-note">Removed from flow</p>
+                </article>
+                <article class="card metric">
+                    <p class="metric-label">No Show</p>
+                    <p class="metric-value">0</p>
+                    <p class="metric-note">Missed appointments</p>
+                </article>
+            </section>
+
+            <section class="content-grid">
+                <article class="card panel">
+                    <div class="panel-header">
+                        <h2>Service Breakdown</h2>
+                        <p class="panel-kicker">12 total</p>
+                    </div>
+                    <div class="list">
+                        <div class="row">
+                            <span class="row-label">Haircut</span>
+                            <span class="row-value">4</span>
+                            <div class="bar"><span style="width: 100%;"></span></div>
+                        </div>
+                        <div class="row">
+                            <span class="row-label">Coloring</span>
+                            <span class="row-value">3</span>
+                            <div class="bar"><span style="width: 75%;"></span></div>
+                        </div>
+                        <div class="row">
+                            <span class="row-label">Full Set Lashes</span>
+                            <span class="row-value">2</span>
+                            <div class="bar"><span style="width: 50%;"></span></div>
+                        </div>
+                        <div class="row">
+                            <span class="row-label">Lash Fill</span>
+                            <span class="row-value">2</span>
+                            <div class="bar"><span style="width: 50%;"></span></div>
+                        </div>
+                        <div class="row">
+                            <span class="row-label">Consultation</span>
+                            <span class="row-value">1</span>
+                            <div class="bar"><span style="width: 25%;"></span></div>
+                        </div>
+                    </div>
+                </article>
+
+                <article class="card panel">
+                    <div class="panel-header">
+                        <h2>Priority Breakdown</h2>
+                        <p class="panel-kicker">Demo mix</p>
+                    </div>
+                    <div class="list">
+                        <div class="row">
+                            <span class="row-label">Normal</span>
+                            <span class="row-value">10</span>
+                            <div class="bar"><span class="success" style="width: 100%;"></span></div>
+                        </div>
+                        <div class="row">
+                            <span class="row-label">Low</span>
+                            <span class="row-value">2</span>
+                            <div class="bar"><span class="warning" style="width: 20%;"></span></div>
+                        </div>
+                    </div>
+                </article>
+            </section>
+
+            <footer>Receptionist Core - Modular intake, scheduling, and workflow engine</footer>
+        </main>
+    </body>
+    </html>
+    """
 
 
 @app.get("/debug/database-url")
