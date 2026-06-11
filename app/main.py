@@ -57,6 +57,21 @@ ALLOWED_INTAKE_FILTER_FIELDS = {
     "priority",
 }
 
+BUSINESS_SETTINGS = {
+    "auto_confirm": False,
+    "confirmation_required": True,
+    "deposits_enabled": False,
+    "notifications_enabled": False,
+    "cancellation_window_hours": 24,
+    "booking_lead_time_hours": 2,
+    "max_advance_booking_days": 30,
+    "timezone": "America/New_York",
+}
+
+
+def get_business_setting(setting_name, default=None):
+    return BUSINESS_SETTINGS.get(setting_name, default)
+
 
 def normalize_time_value(value):
     if value is None:
@@ -378,6 +393,14 @@ def health_check():
     return {
         "ok": True,
         "service": "receptionist-core"
+    }
+
+
+@app.get("/settings")
+def get_settings(admin_auth: bool = Depends(require_admin_auth)):
+    return {
+        "status": "ok",
+        "settings": BUSINESS_SETTINGS,
     }
 
 
