@@ -1,9 +1,11 @@
 import os
 import psycopg2
+from datetime import datetime, timedelta
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 
 app = FastAPI(
@@ -71,6 +73,133 @@ BUSINESS_SETTINGS = {
 
 def get_business_setting(setting_name, default=None):
     return BUSINESS_SETTINGS.get(setting_name, default)
+
+
+def get_booking_lead_time_hours():
+    try:
+        return int(get_business_setting("booking_lead_time_hours", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def get_max_advance_booking_days():
+    try:
+        return int(get_business_setting("max_advance_booking_days", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def get_business_timezone():
+    timezone_name = get_business_setting("timezone", "America/New_York")
+    try:
+        return ZoneInfo(timezone_name)
+    except Exception:
+        return ZoneInfo("America/New_York")
+
+
+def get_business_now():
+    return datetime.now(get_business_timezone())
+
+
+def parse_requested_datetime(value, now=None):
+    if value is None:
+        return None
+
+    requested_value = str(value).strip()
+    if not requested_value or requested_value.lower() in {"null", "none", "string"}:
+        return None
+
+    timezone = get_business_timezone()
+    if now is None:
+        now = get_business_now()
+
+    try:
+        parsed_datetime = datetime.fromisoformat(requested_value.replace("Z", "+00:00"))
+        if parsed_datetime.tzinfo is None:
+            return parsed_datetime.replace(tzinfo=timezone)
+        return parsed_datetime.astimezone(timezone)
+    except ValueError:
+        pass
+
+    normalized_time = normalize_time_value(requested_value)
+    if normalized_time is None or ":" not in normalized_time:
+        return None
+
+    try:
+        hour, minute = map(int, normalized_time.split(":"))
+        return datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone).replace(
+            hour=hour,
+            minute=minute,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def is_valid_preferred_time(value):
+    if value is None:
+        return True
+
+    return parse_requested_datetime(value) is not None
+
+
+def invalid_preferred_time_response(service_type, service):
+    return {
+        "status": "error",
+        "service_type": service_type,
+        "industry": service["industry"],
+        "duration_minutes": service["duration_minutes"],
+        "priority": service["priority"],
+        "message": "Invalid preferred_time format",
+    }
+
+
+def get_booking_window_message(preferred_time):
+    requested_datetime = parse_requested_datetime(preferred_time)
+    if requested_datetime is None:
+        return None
+
+    return get_booking_window_message_for_datetime(requested_datetime)
+
+
+def get_booking_window_message_for_datetime(requested_datetime):
+    now = get_business_now()
+    lead_time_hours = get_booking_lead_time_hours()
+    if lead_time_hours > 0 and requested_datetime < now + timedelta(hours=lead_time_hours):
+        return "Requested time is inside booking lead-time window."
+
+    max_advance_booking_days = get_max_advance_booking_days()
+    if max_advance_booking_days > 0 and requested_datetime > now + timedelta(days=max_advance_booking_days):
+        return "Requested time exceeds maximum advance booking window."
+
+    return None
+
+
+def get_slot_datetime(slot_time, reference_time=None):
+    normalized_time = normalize_time_value(slot_time)
+    if normalized_time is None or ":" not in normalized_time:
+        return None
+
+    reference_datetime = parse_requested_datetime(reference_time) if reference_time else get_business_now()
+    if reference_datetime is None:
+        reference_datetime = get_business_now()
+
+    try:
+        hour, minute = map(int, normalized_time.split(":"))
+    except (TypeError, ValueError):
+        return None
+
+    return datetime.combine(
+        reference_datetime.date(),
+        datetime.min.time(),
+        tzinfo=get_business_timezone(),
+    ).replace(hour=hour, minute=minute)
+
+
+def slot_passes_booking_window(slot_time, reference_time=None):
+    slot_datetime = get_slot_datetime(slot_time, reference_time)
+    if slot_datetime is None:
+        return False
+    return get_booking_window_message_for_datetime(slot_datetime) is None
 
 
 def normalize_time_value(value):
@@ -208,16 +337,26 @@ def find_next_available_slot(duration_minutes: int, preferred_time: Optional[str
     slots = generate_time_slots()
 
     if preferred_time:
-        if preferred_time in slots and is_slot_available(preferred_time, duration_minutes):
+        raw_preferred_time = preferred_time
+        preferred_time = normalize_time_value(preferred_time)
+        if (
+            preferred_time in slots
+            and slot_passes_booking_window(preferred_time, raw_preferred_time)
+            and is_slot_available(preferred_time, duration_minutes)
+        ):
             return preferred_time
         preferred_minutes = time_to_minutes(preferred_time)
         for slot in slots:
-            if time_to_minutes(slot) > preferred_minutes and is_slot_available(slot, duration_minutes):
+            if (
+                time_to_minutes(slot) > preferred_minutes
+                and slot_passes_booking_window(slot, raw_preferred_time)
+                and is_slot_available(slot, duration_minutes)
+            ):
                 return slot
         return None
 
     for slot in slots:
-        if is_slot_available(slot, duration_minutes):
+        if slot_passes_booking_window(slot) and is_slot_available(slot, duration_minutes):
             return slot
 
     return None
@@ -228,12 +367,17 @@ def find_available_options(duration_minutes: int, preferred_time: Optional[str] 
     options = []
 
     if preferred_time:
+        raw_preferred_time = preferred_time
         preferred_time = normalize_time_value(preferred_time)
         preferred_minutes = time_to_minutes(preferred_time)
 
         for slot in slots:
             try:
-                if time_to_minutes(slot) >= preferred_minutes and is_slot_available(slot, duration_minutes):
+                if (
+                    time_to_minutes(slot) >= preferred_minutes
+                    and slot_passes_booking_window(slot, raw_preferred_time)
+                    and is_slot_available(slot, duration_minutes)
+                ):
                     options.append({
                         "time": slot,
                         "display": format_display_time(slot)
@@ -245,7 +389,7 @@ def find_available_options(duration_minutes: int, preferred_time: Optional[str] 
         return options
 
     for slot in slots:
-        if is_slot_available(slot, duration_minutes):
+        if slot_passes_booking_window(slot) and is_slot_available(slot, duration_minutes):
             options.append({
                 "time": slot,
                 "display": format_display_time(slot)
@@ -849,8 +993,12 @@ def debug_database_url(admin_auth: bool = Depends(require_admin_auth)):
 def create_intake(request: IntakeRequest):
     service_type = detect_service(request.reason)
     service = SERVICES.get(service_type, SERVICES["consultation"])
-    preferred_time = normalize_time_value(request.preferred_time)
     duration_minutes = service["duration_minutes"]
+
+    if not is_valid_preferred_time(request.preferred_time):
+        return invalid_preferred_time_response(service_type, service)
+
+    preferred_time = normalize_time_value(request.preferred_time)
 
     if preferred_time is None:
         options = find_available_options(duration_minutes)
@@ -863,6 +1011,25 @@ def create_intake(request: IntakeRequest):
             "available_options": options,
         }
 
+    booking_window_message = get_booking_window_message(request.preferred_time)
+    if booking_window_message:
+        if booking_window_message == "Requested time exceeds maximum advance booking window.":
+            options = []
+        else:
+            try:
+                options = find_available_options(duration_minutes, request.preferred_time)
+            except (TypeError, ValueError):
+                options = find_available_options(duration_minutes)
+        return {
+            "status": "slot_unavailable",
+            "service_type": service_type,
+            "industry": service["industry"],
+            "duration_minutes": service["duration_minutes"],
+            "priority": service["priority"],
+            "available_options": options,
+            "message": booking_window_message,
+        }
+
     try:
         preferred_time_available = is_slot_available(preferred_time, duration_minutes)
     except (TypeError, ValueError):
@@ -870,7 +1037,7 @@ def create_intake(request: IntakeRequest):
 
     if not preferred_time_available:
         try:
-            options = find_available_options(duration_minutes, preferred_time)
+            options = find_available_options(duration_minutes, request.preferred_time)
         except (TypeError, ValueError):
             options = find_available_options(duration_minutes)
         return {
@@ -941,6 +1108,21 @@ def create_intake(request: IntakeRequest):
 def get_availability(request: AvailabilityRequest):
     service_type = detect_service(request.reason)
     service = SERVICES.get(service_type, SERVICES["consultation"])
+
+    if not is_valid_preferred_time(request.preferred_time):
+        return invalid_preferred_time_response(service_type, service)
+
+    booking_window_message = get_booking_window_message(request.preferred_time)
+    if booking_window_message:
+        return {
+            "status": "no_availability",
+            "service_type": service_type,
+            "industry": service["industry"],
+            "duration_minutes": service["duration_minutes"],
+            "priority": service["priority"],
+            "available_options": [],
+            "message": booking_window_message,
+        }
 
     options = find_available_options(
         service["duration_minutes"],
