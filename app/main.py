@@ -104,6 +104,25 @@ def build_notification_decision():
     }
 
 
+def get_deposits_enabled():
+    value = get_business_setting("deposits_enabled", False)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def should_require_deposit():
+    return get_deposits_enabled()
+
+
+def build_deposit_decision():
+    deposits_enabled = should_require_deposit()
+    return {
+        "deposits_enabled": deposits_enabled,
+        "deposit_required": deposits_enabled,
+    }
+
+
 def get_booking_lead_time_hours():
     try:
         return int(get_business_setting("booking_lead_time_hours", 0) or 0)
@@ -1143,6 +1162,7 @@ def create_intake(request: IntakeRequest):
             "scheduled_time": scheduled_time,
             "scheduling_note": scheduling_note,
             "notification_decision": build_notification_decision(),
+            "deposit_decision": build_deposit_decision(),
             "data": record,
         }
     except Exception as e:
