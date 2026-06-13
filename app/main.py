@@ -85,6 +85,25 @@ def determine_initial_booking_status():
     return "needs_confirmation"
 
 
+def get_notifications_enabled():
+    value = get_business_setting("notifications_enabled", False)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def should_send_notifications():
+    return get_notifications_enabled()
+
+
+def build_notification_decision():
+    notifications_enabled = should_send_notifications()
+    return {
+        "notifications_enabled": notifications_enabled,
+        "notification_pending": notifications_enabled,
+    }
+
+
 def get_booking_lead_time_hours():
     try:
         return int(get_business_setting("booking_lead_time_hours", 0) or 0)
@@ -1123,6 +1142,7 @@ def create_intake(request: IntakeRequest):
             "priority": service["priority"],
             "scheduled_time": scheduled_time,
             "scheduling_note": scheduling_note,
+            "notification_decision": build_notification_decision(),
             "data": record,
         }
     except Exception as e:
@@ -1358,6 +1378,7 @@ def update_intake_status_endpoint(request_id: int, update: StatusUpdate, admin_a
             return {
                 "status": "ok",
                 "message": "Appointment status updated",
+                "notification_decision": build_notification_decision(),
                 "data": record,
             }
         return {
