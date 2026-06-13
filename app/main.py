@@ -45,6 +45,7 @@ SERVICES = {
 
 VALID_APPOINTMENT_STATUSES = {
     "pending",
+    "needs_confirmation",
     "scheduled",
     "confirmed",
     "checked_in",
@@ -73,6 +74,15 @@ BUSINESS_SETTINGS = {
 
 def get_business_setting(setting_name, default=None):
     return BUSINESS_SETTINGS.get(setting_name, default)
+
+
+def determine_initial_booking_status():
+    auto_confirm = bool(get_business_setting("auto_confirm", False))
+    confirmation_required = bool(get_business_setting("confirmation_required", True))
+
+    if auto_confirm and not confirmation_required:
+        return "scheduled"
+    return "needs_confirmation"
 
 
 def get_booking_lead_time_hours():
@@ -298,7 +308,7 @@ def get_active_bookings():
             SELECT scheduled_time, duration_minutes
             FROM intake_requests
             WHERE scheduled_time IS NOT NULL
-              AND appointment_status IN ('scheduled', 'pending')
+              AND appointment_status IN ('scheduled', 'pending', 'needs_confirmation')
         """)
         rows = cursor.fetchall()
         cursor.close()
@@ -1050,7 +1060,7 @@ def create_intake(request: IntakeRequest):
         }
 
     scheduled_time = preferred_time
-    appointment_status = "scheduled" if scheduled_time else "pending"
+    appointment_status = determine_initial_booking_status() if scheduled_time else "pending"
 
     try:
         conn = get_db_connection()
@@ -1074,13 +1084,13 @@ def create_intake(request: IntakeRequest):
             scheduling_note = "no_availability"
         elif preferred_time:
             if scheduled_time == preferred_time:
-                status = "scheduled"
+                status = appointment_status
                 scheduling_note = "preferred_time_confirmed"
             else:
-                status = "scheduled"
+                status = appointment_status
                 scheduling_note = "preferred_time_unavailable_next_slot_assigned"
         else:
-            status = "scheduled"
+            status = appointment_status
             scheduling_note = "next_available_assigned"
 
         return {
