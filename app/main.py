@@ -99,6 +99,13 @@ def get_max_advance_booking_days():
         return 0
 
 
+def get_cancellation_window_hours():
+    try:
+        return int(get_business_setting("cancellation_window_hours", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def get_business_timezone():
     timezone_name = get_business_setting("timezone", "America/New_York")
     try:
@@ -161,6 +168,21 @@ def invalid_preferred_time_response(service_type, service):
         "priority": service["priority"],
         "message": "Invalid preferred_time format",
     }
+
+
+def can_cancel_booking(appointment_time, now=None):
+    appointment_datetime = parse_requested_datetime(appointment_time, now)
+    if appointment_datetime is None:
+        return True
+
+    if now is None:
+        now = get_business_now()
+
+    cancellation_window_hours = get_cancellation_window_hours()
+    if cancellation_window_hours <= 0:
+        return True
+
+    return appointment_datetime - now >= timedelta(hours=cancellation_window_hours)
 
 
 def get_booking_window_message(preferred_time):
@@ -1294,6 +1316,21 @@ def update_intake_status(request_id, status):
     return record_from_tuple(row)
 
 
+def fetch_intake_by_id(request_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, name, phone, email, reason, preferred_time, source, scheduled_time, appointment_status, service_type, industry, duration_minutes, priority, created_at
+        FROM intake_requests
+        WHERE id = %s
+    """, (request_id,))
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    return record_from_tuple(row)
+
+
 @app.put("/intakes/{request_id}/status")
 def update_intake_status_endpoint(request_id: int, update: StatusUpdate, admin_auth: bool = Depends(require_admin_auth)):
     if update.appointment_status not in VALID_APPOINTMENT_STATUSES:
@@ -1303,6 +1340,19 @@ def update_intake_status_endpoint(request_id: int, update: StatusUpdate, admin_a
         }
 
     try:
+        if update.appointment_status == "cancelled":
+            current_record = fetch_intake_by_id(request_id)
+            if not current_record:
+                return {
+                    "status": "not_found",
+                    "message": "Intake request not found",
+                }
+            if not can_cancel_booking(current_record["scheduled_time"]):
+                return {
+                    "status": "error",
+                    "message": "Cancellation window has passed",
+                }
+
         record = update_intake_status(request_id, update.appointment_status)
         if record:
             return {
