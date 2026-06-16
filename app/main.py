@@ -85,6 +85,19 @@ def determine_initial_booking_status():
     return "needs_confirmation"
 
 
+def determine_initial_appointment_status():
+    auto_confirm = get_business_setting("auto_confirm", False)
+    confirmation_required = get_business_setting("confirmation_required", True)
+
+    if auto_confirm:
+        return "confirmed"
+
+    if confirmation_required:
+        return "scheduled"
+
+    return "scheduled"
+
+
 def get_notifications_enabled():
     value = get_business_setting("notifications_enabled", False)
     if isinstance(value, str):
@@ -1120,7 +1133,7 @@ def create_intake(request: IntakeRequest):
         }
 
     scheduled_time = preferred_time
-    appointment_status = determine_initial_booking_status() if scheduled_time else "pending"
+    appointment_status = determine_initial_appointment_status() if scheduled_time else "pending"
 
     try:
         conn = get_db_connection()
