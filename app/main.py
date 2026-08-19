@@ -1,4 +1,5 @@
 import os
+import secrets
 import psycopg2
 from datetime import datetime, timedelta
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -595,12 +596,20 @@ def fetch_intakes_by_field(field_name, value):
 def require_admin_auth(authorization: Optional[str] = Header(None)):
     expected_token = os.getenv("ADMIN_API_TOKEN")
     if not expected_token:
-        raise HTTPException(status_code=500, detail="ADMIN_API_TOKEN is not configured")
+        raise HTTPException(status_code=500, detail="Internal server error")
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid authorization header")
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     token = authorization.replace("Bearer ", "", 1).strip()
-    if token != expected_token:
-        raise HTTPException(status_code=403, detail="Invalid admin token")
+    if not secrets.compare_digest(token, expected_token):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     return True
 
 
@@ -685,10 +694,10 @@ def dashboard_stats(admin_auth: bool = Depends(require_admin_auth)):
             "by_service_type": by_service_type,
             "by_priority": by_priority,
         }
-    except Exception as e:
+    except Exception:
         return {
             "status": "error",
-            "message": f"Failed to fetch dashboard stats: {str(e)}",
+            "message": "Failed to fetch dashboard stats",
         }
 
 
@@ -1063,15 +1072,6 @@ def admin_dashboard_demo():
     """
 
 
-@app.get("/debug/database-url")
-def debug_database_url(admin_auth: bool = Depends(require_admin_auth)):
-    database_url = os.getenv("DATABASE_URL")
-    return {
-        "database_url_set": bool(database_url),
-        "database_url_preview": database_url[:25] if database_url else None,
-    }
-
-
 @app.post("/intake")
 def create_intake(request: IntakeRequest):
     service_type = detect_service(request.reason)
@@ -1178,14 +1178,14 @@ def create_intake(request: IntakeRequest):
             "deposit_decision": build_deposit_decision(),
             "data": record,
         }
-    except Exception as e:
+    except Exception:
         return {
             "status": "error",
             "service_type": service_type,
             "industry": service["industry"],
             "duration_minutes": service["duration_minutes"],
             "priority": service["priority"],
-            "message": f"Failed to create intake: {str(e)}",
+            "message": "Failed to create intake",
         }
 
 
@@ -1254,10 +1254,10 @@ def list_intakes(admin_auth: bool = Depends(require_admin_auth)):
             "count": len(records),
             "data": records,
         }
-    except Exception as e:
+    except Exception:
         return {
             "status": "error",
-            "message": f"Failed to fetch intakes: {str(e)}",
+            "message": "Failed to fetch intakes",
         }
 
 
@@ -1278,10 +1278,10 @@ def list_intakes_by_status(status: str, admin_auth: bool = Depends(require_admin
             "count": len(records),
             "data": records,
         }
-    except Exception as e:
+    except Exception:
         return {
             "status": "error",
-            "message": f"Failed to fetch intakes: {str(e)}",
+            "message": "Failed to fetch intakes",
         }
 
 
@@ -1296,10 +1296,10 @@ def list_intakes_by_service(service_type: str, admin_auth: bool = Depends(requir
             "count": len(records),
             "data": records,
         }
-    except Exception as e:
+    except Exception:
         return {
             "status": "error",
-            "message": f"Failed to fetch intakes: {str(e)}",
+            "message": "Failed to fetch intakes",
         }
 
 
@@ -1314,10 +1314,10 @@ def list_intakes_by_priority(priority: str, admin_auth: bool = Depends(require_a
             "count": len(records),
             "data": records,
         }
-    except Exception as e:
+    except Exception:
         return {
             "status": "error",
-            "message": f"Failed to fetch intakes: {str(e)}",
+            "message": "Failed to fetch intakes",
         }
 
 
@@ -1345,10 +1345,10 @@ def get_intake(request_id: int, admin_auth: bool = Depends(require_admin_auth)):
             "status": "not_found",
             "message": "Intake request not found",
         }
-    except Exception as e:
+    except Exception:
         return {
             "status": "error",
-            "message": f"Failed to fetch intake: {str(e)}",
+            "message": "Failed to fetch intake",
         }
 
 
@@ -1418,10 +1418,10 @@ def update_intake_status_endpoint(request_id: int, update: StatusUpdate, admin_a
             "status": "not_found",
             "message": "Intake request not found",
         }
-    except Exception as e:
+    except Exception:
         return {
             "status": "error",
-            "message": f"Failed to update intake status: {str(e)}",
+            "message": "Failed to update intake status",
         }
 
 
@@ -1450,8 +1450,8 @@ def delete_intake(request_id: int, admin_auth: bool = Depends(require_admin_auth
             "status": "not_found",
             "message": "Intake request not found",
         }
-    except Exception as e:
+    except Exception:
         return {
             "status": "error",
-            "message": f"Failed to delete intake: {str(e)}",
+            "message": "Failed to delete intake",
         }

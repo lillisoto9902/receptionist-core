@@ -66,7 +66,6 @@ The API will be available at `http://127.0.0.1:8000`.
 
 - `GET /`: basic service status
 - `GET /health`: health check
-- `GET /debug/database-url`: confirms whether `DATABASE_URL` is set and shows a short preview
 - `POST /availability`: returns available appointment options for a requested service reason
 - `POST /intake`: confirms and stores an intake only when a selected preferred time is available
 - `GET /intakes`: lists intake records
