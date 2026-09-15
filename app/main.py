@@ -604,7 +604,12 @@ def require_admin_auth(authorization: Optional[str] = Header(None)):
             headers={"WWW-Authenticate": "Bearer"},
         )
     token = authorization.replace("Bearer ", "", 1).strip()
-    if not secrets.compare_digest(token, expected_token):
+    try:
+        token_matches = secrets.compare_digest(token, expected_token)
+    except TypeError:
+        # String comparison rejects non-ASCII text; treat it as invalid credentials.
+        token_matches = False
+    if not token_matches:
         raise HTTPException(
             status_code=401,
             detail="Unauthorized",
