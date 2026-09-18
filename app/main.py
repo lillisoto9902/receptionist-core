@@ -1,9 +1,10 @@
 import os
 import secrets
 import psycopg2
-from datetime import datetime, timedelta
+from contextlib import closing
+from datetime import datetime, time, timedelta
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -14,6 +15,15 @@ app = FastAPI(
     description="A modular digital receptionist engine for intake, scheduling, and client communication.",
     version="0.1.0",
 )
+
+
+class SchedulingDataError(Exception):
+    """Reserving booking data could not be read or evaluated reliably."""
+
+
+@app.exception_handler(SchedulingDataError)
+async def scheduling_unavailable_handler(request, exc):
+    return JSONResponse(status_code=503, content={"detail": "Scheduling unavailable"})
 
 
 class IntakeRequest(BaseModel):
@@ -353,8 +363,12 @@ def generate_time_slots():
 
 
 def time_fits(start_time: str, duration_minutes: int):
-    end_minutes = time_to_minutes(start_time) + duration_minutes
-    return end_minutes <= 17 * 60
+    start_minutes = time_to_minutes(start_time)
+    return (
+        9 * 60 <= start_minutes
+        and start_minutes % 30 == 0
+        and start_minutes + duration_minutes <= 17 * 60
+    )
 
 
 def times_overlap(start_a: str, duration_a: int, start_b: str, duration_b: int):
@@ -376,32 +390,40 @@ def times_overlap(start_a: str, duration_a: int, start_b: str, duration_b: int):
 
 def get_active_bookings():
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
+        with closing(get_db_connection()) as conn, closing(conn.cursor()) as cursor:
+            cursor.execute("""
             SELECT scheduled_time, duration_minutes
             FROM intake_requests
             WHERE scheduled_time IS NOT NULL
               AND appointment_status IN ('scheduled', 'pending', 'needs_confirmation')
         """)
-        rows = cursor.fetchall()
-        cursor.close()
-        conn.close()
+            rows = cursor.fetchall()
         bookings = []
         for row in rows:
+            if not isinstance(row, (tuple, list)) or len(row) != 2:
+                raise SchedulingDataError()
+            if not isinstance(row[0], str):
+                raise SchedulingDataError()
+            raw_time = row[0].strip()
+            if "T" in raw_time:
+                datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+            elif len(raw_time.split(":")) > 2:
+                time.fromisoformat(raw_time)
             scheduled_time = normalize_time_value(row[0])
             duration_minutes = row[1]
-            if scheduled_time is None or duration_minutes is None:
-                continue
-            try:
-                time_to_minutes(scheduled_time)
-                duration_minutes = int(duration_minutes)
-            except (TypeError, ValueError):
-                continue
+            if scheduled_time is None:
+                raise SchedulingDataError()
+            hour, minute = map(int, scheduled_time.split(":"))
+            if not (0 <= hour < 24 and 0 <= minute < 60):
+                raise SchedulingDataError()
+            if type(duration_minutes) is not int or duration_minutes <= 0:
+                raise SchedulingDataError()
             bookings.append((scheduled_time, duration_minutes))
         return bookings
+    except SchedulingDataError:
+        raise
     except Exception:
-        return []
+        raise SchedulingDataError() from None
 
 
 def is_slot_available(start_time: str, duration_minutes: int):
@@ -409,9 +431,6 @@ def is_slot_available(start_time: str, duration_minutes: int):
         return False
 
     for booking_time, booking_duration in get_active_bookings():
-        booking_time = normalize_time_value(booking_time)
-        if booking_time is None:
-            continue
         if times_overlap(start_time, duration_minutes, booking_time, booking_duration):
             return False
     return True
@@ -466,7 +485,9 @@ def find_available_options(duration_minutes: int, preferred_time: Optional[str] 
                         "time": slot,
                         "display": format_display_time(slot)
                     })
-            except:
+            except SchedulingDataError:
+                raise
+            except (TypeError, ValueError):
                 continue
             if len(options) >= limit:
                 break
@@ -510,8 +531,8 @@ def get_db_connection():
     try:
         conn = psycopg2.connect(database_url)
         return conn
-    except Exception as e:
-        print(f"Database connection failed: {e}")
+    except Exception:
+        print("Database connection failed")
         raise
 
 
