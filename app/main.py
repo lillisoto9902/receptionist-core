@@ -1,22 +1,37 @@
 import os
 import secrets
 import psycopg2
-from contextlib import closing, nullcontext
+from contextlib import closing, nullcontext, asynccontextmanager
 from datetime import datetime, time, timedelta, timezone
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.exceptions import RequestValidationError
-from app import companies
+from app import companies, operations
+from app.request_safety import RequestSafety, bearer_valid
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing import Optional
 from zoneinfo import ZoneInfo
+
+
+@asynccontextmanager
+async def lifespan(application):
+    try:
+        await run_in_threadpool(operations.check_ready, get_db_connection)
+    except Exception:
+        raise RuntimeError('Application startup validation failed') from None
+    yield
 
 
 app = FastAPI(
     title="Receptionist Core",
     description="A modular digital receptionist engine for intake, scheduling, and client communication.",
     version="0.1.0",
+    lifespan=lifespan,
+    docs_url=None, redoc_url=None, openapi_url=None,
 )
+
+app.add_middleware(RequestSafety)
 
 
 class SchedulingConflict(Exception):
@@ -32,22 +47,33 @@ async def scheduling_unavailable_handler(request, exc):
     return JSONResponse(status_code=503, content={"detail": "Scheduling unavailable"})
 
 
-class IntakeRequest(BaseModel):
-    name: str
-    phone: str
-    email: Optional[str] = None
-    reason: str
-    preferred_time: Optional[str] = None
-    source: Optional[str] = "form"
+class RequestModel(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True, str_strip_whitespace=True)
+
+    @field_validator('*')
+    @classmethod
+    def reject_nul(cls, value):
+        if isinstance(value, str) and '\x00' in value:
+            raise ValueError('Invalid request')
+        return value
 
 
-class AvailabilityRequest(BaseModel):
-    reason: str
-    preferred_time: Optional[str] = None
+class IntakeRequest(RequestModel):
+    name: str = Field(min_length=1, max_length=120)
+    phone: str = Field(min_length=1, max_length=40)
+    email: Optional[str] = Field(default=None, max_length=254)
+    reason: str = Field(min_length=1, max_length=500)
+    preferred_time: Optional[str] = Field(default=None, max_length=80)
+    source: Optional[str] = Field(default='form', min_length=1, max_length=40)
 
 
-class StatusUpdate(BaseModel):
-    appointment_status: str
+class AvailabilityRequest(RequestModel):
+    reason: str = Field(min_length=1, max_length=500)
+    preferred_time: Optional[str] = Field(default=None, max_length=80)
+
+
+class StatusUpdate(RequestModel):
+    appointment_status: str = Field(min_length=1, max_length=32)
 
 
 SERVICES = {
@@ -206,7 +232,7 @@ def parse_requested_datetime(value, now=None):
                 return None
             return local
         return parsed_datetime.astimezone(timezone)
-    except ValueError:
+    except (ValueError, OverflowError):
         if "T" in requested_value or " " in requested_value:
             return None
 
@@ -535,22 +561,12 @@ def detect_service(reason: str):
 
 
 def get_db_connection():
-    database_url = os.getenv("DATABASE_URL")
+    return operations.connect()
 
-    if not database_url:
-        raise RuntimeError("DATABASE_URL environment variable is not set")
 
+def init_db(connection_factory=None):
     try:
-        conn = psycopg2.connect(database_url)
-        return conn
-    except Exception:
-        print("Database connection failed")
-        raise
-
-
-def init_db():
-    try:
-        conn = get_db_connection()
+        conn = (connection_factory or get_db_connection)()
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS companies (
@@ -645,13 +661,13 @@ def require_admin_auth(authorization: Optional[str] = Header(None)):
     expected_token = os.getenv("ADMIN_API_TOKEN")
     if not expected_token:
         raise HTTPException(status_code=500, detail="Internal server error")
-    if not authorization or not authorization.startswith("Bearer "):
+    if not bearer_valid(authorization):
         raise HTTPException(
             status_code=401,
             detail="Unauthorized",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    token = authorization.replace("Bearer ", "", 1).strip()
+    token = authorization[7:]
     try:
         token_matches = secrets.compare_digest(token, expected_token)
     except TypeError:
@@ -683,6 +699,15 @@ def health_check():
         "ok": True,
         "service": "receptionist-core"
     }
+
+
+@app.get('/ready')
+def readiness():
+    try:
+        operations.check_ready(get_db_connection)
+        return {'ready': True}
+    except Exception:
+        return JSONResponse(status_code=503, content={'ready': False})
 
 
 @app.get("/settings")
@@ -747,10 +772,7 @@ def dashboard_stats(admin_auth: bool = Depends(companies.require_tenant)):
             "by_priority": by_priority,
         }
     except Exception:
-        return {
-            "status": "error",
-            "message": "Failed to fetch dashboard stats",
-        }
+        raise HTTPException(503, "Service unavailable") from None
 
 
 @app.get("/admin/dashboard/demo", response_class=HTMLResponse)
@@ -1243,14 +1265,7 @@ def create_intake(request: IntakeRequest):
     except SchedulingDataError:
         raise
     except Exception:
-        return {
-            "status": "error",
-            "service_type": service_type,
-            "industry": service["industry"],
-            "duration_minutes": service["duration_minutes"],
-            "priority": service["priority"],
-            "message": "Failed to create intake",
-        }
+        raise HTTPException(503, "Service unavailable") from None
 
 
 @app.post("/availability", dependencies=[Depends(companies.require_tenant)])
@@ -1318,10 +1333,7 @@ def list_intakes(admin_auth: bool = Depends(companies.require_tenant)):
             "data": records,
         }
     except Exception:
-        return {
-            "status": "error",
-            "message": "Failed to fetch intakes",
-        }
+        raise HTTPException(503, "Service unavailable") from None
 
 
 @app.get("/intakes/status/{status}")
@@ -1342,10 +1354,7 @@ def list_intakes_by_status(status: str, admin_auth: bool = Depends(companies.req
             "data": records,
         }
     except Exception:
-        return {
-            "status": "error",
-            "message": "Failed to fetch intakes",
-        }
+        raise HTTPException(503, "Service unavailable") from None
 
 
 @app.get("/intakes/service/{service_type}")
@@ -1360,10 +1369,7 @@ def list_intakes_by_service(service_type: str, admin_auth: bool = Depends(compan
             "data": records,
         }
     except Exception:
-        return {
-            "status": "error",
-            "message": "Failed to fetch intakes",
-        }
+        raise HTTPException(503, "Service unavailable") from None
 
 
 @app.get("/intakes/priority/{priority}")
@@ -1378,10 +1384,7 @@ def list_intakes_by_priority(priority: str, admin_auth: bool = Depends(companies
             "data": records,
         }
     except Exception:
-        return {
-            "status": "error",
-            "message": "Failed to fetch intakes",
-        }
+        raise HTTPException(503, "Service unavailable") from None
 
 
 @app.get("/intakes/{request_id}")
@@ -1407,10 +1410,7 @@ def get_intake(request_id: int, admin_auth: bool = Depends(companies.require_ten
             "message": "Intake request not found",
         }
     except Exception:
-        return {
-            "status": "error",
-            "message": "Failed to fetch intake",
-        }
+        raise HTTPException(503, "Service unavailable") from None
 
 
 def update_intake_status(request_id, status):
@@ -1488,10 +1488,7 @@ def update_intake_status_endpoint(request_id: int, update: StatusUpdate, admin_a
     except SchedulingConflict:
         return {'status':'slot_unavailable','message':'Appointment slot unavailable'}
     except Exception:
-        return {
-            "status": "error",
-            "message": "Failed to update intake status",
-        }
+        raise HTTPException(503, "Service unavailable") from None
 
 
 @app.delete("/intakes/{request_id}")
@@ -1518,10 +1515,7 @@ def delete_intake(request_id: int, admin_auth: bool = Depends(companies.require_
             "message": "Intake request not found",
         }
     except Exception:
-        return {
-            "status": "error",
-            "message": "Failed to delete intake",
-        }
+        raise HTTPException(503, "Service unavailable") from None
 
 
 @app.post('/platform/companies/{tenant_id}')

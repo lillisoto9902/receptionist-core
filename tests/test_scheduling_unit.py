@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 from app import main, companies
 from company_fixture import configuration
+from operations_fixture import environment
 
 
 class SchedulingFixture(unittest.TestCase):
@@ -155,10 +156,10 @@ class BookingLookupTests(SchedulingFixture):
         self.network.side_effect = RuntimeError("synthetic secret SQL customer detail")
         output = io.StringIO()
         with patch.object(main, "get_db_connection", self.real_get_db_connection), \
-                patch.dict(main.os.environ, {"DATABASE_URL": "synthetic-unused"}), redirect_stdout(output):
+                patch.dict(main.os.environ, environment(), clear=True), redirect_stdout(output):
             with self.assertRaises(main.SchedulingDataError):
                 main.get_active_bookings()
-        self.assertEqual(output.getvalue(), "Database connection failed\n")
+        self.assertEqual(output.getvalue(), "")
         self.network.assert_called_once()
         self.network.reset_mock()
 
