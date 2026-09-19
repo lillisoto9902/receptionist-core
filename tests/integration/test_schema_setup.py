@@ -1,12 +1,16 @@
 """Opt-in live tests; external preflight/startup/shutdown remain mandatory."""
 
 import os
+import json
+import hashlib
+import secrets
 import unittest
 from unittest.mock import patch
 
 import psycopg2
 
-from app import main
+from app import main, companies
+from company_fixture import configuration
 from . import _database_guard as guard
 from ._schema_setup import BorrowedConnection, isolated_schema, relations
 
@@ -21,13 +25,15 @@ class SchemaIntegrationTests(unittest.TestCase):
             try:
                 guard.query(connection, "SET statement_timeout = '5s'")
                 guard.query(connection, "SET lock_timeout = '2s'")
+                marker = companies.context.set({'tenant_id':'synthetic-a','configuration':configuration()})
+                guard.query(connection, 'INSERT INTO companies VALUES (%s,%s::jsonb,%s)', ('synthetic-a',json.dumps(configuration()),hashlib.sha256(secrets.token_bytes(32)).hexdigest()))
                 columns = guard.query(connection, """
                     SELECT column_name FROM information_schema.columns
                     WHERE table_schema='public' AND table_name='intake_requests'
                     ORDER BY ordinal_position
                 """)
                 self.assertEqual([r[0] for r in columns], [
-                    'id','name','phone','email','reason','preferred_time','source',
+                    'id','tenant_id','scheduled_at','name','phone','email','reason','preferred_time','source',
                     'scheduled_time','appointment_status','service_type','industry',
                     'duration_minutes','priority','created_at',
                 ])
@@ -35,12 +41,12 @@ class SchemaIntegrationTests(unittest.TestCase):
                     'SELECT count(*) FROM public.intake_requests'), [(0,)])
                 guard.query(connection, """
                     INSERT INTO public.intake_requests
-                    (name,phone,reason,scheduled_time,appointment_status,duration_minutes)
-                    VALUES ('Synthetic','000','consultation','09:00','scheduled',30)
-                """)
+                    (tenant_id,scheduled_at,name,phone,reason,scheduled_time,appointment_status,duration_minutes)
+                    VALUES ('synthetic-a',%s,'Synthetic','000','consultation','09:00','scheduled',30)
+                """, (main.get_business_now().replace(hour=9,minute=0,second=0,microsecond=0),))
                 with patch.object(main, 'get_db_connection',
                                   return_value=BorrowedConnection(connection)):
-                    self.assertEqual(main.get_active_bookings(), [('09:00', 30)])
+                    self.assertEqual(main.get_active_bookings(), [(main.get_business_now().replace(hour=9,minute=0,second=0,microsecond=0), 30)])
                     self.assertFalse(main.is_slot_available('09:00', 30))
                     self.assertTrue(main.is_slot_available('10:00', 30))
                 guard.query(connection, "UPDATE public.intake_requests SET appointment_status='cancelled'")
@@ -79,6 +85,8 @@ class SchemaIntegrationTests(unittest.TestCase):
                         connection.rollback()
                     self.assertEqual(code, '42501')
             finally:
+                if 'marker' in locals():
+                    companies.context.reset(marker)
                 connection.rollback()
                 connection.close()
         connection = target.connect(guard.APP_ROLE)

@@ -24,6 +24,9 @@ class BorrowedConnection:
     def commit(self):
         pass
 
+    def rollback(self):
+        self.connection.rollback()
+
     def close(self):
         pass
 
@@ -46,9 +49,13 @@ def bootstrap(connection):
         main.init_db()
     guard.require(not output.getvalue(), 'Schema bootstrap failed')
     expected = [
+        ('public', 'companies', 'r', guard.MIGRATOR_ROLE),
+        ('public', 'companies_credential_digest_key', 'i', guard.MIGRATOR_ROLE),
+        ('public', 'companies_pkey', 'i', guard.MIGRATOR_ROLE),
         ('public', 'intake_requests', 'r', guard.MIGRATOR_ROLE),
         ('public', 'intake_requests_id_seq', 'S', guard.MIGRATOR_ROLE),
         ('public', 'intake_requests_pkey', 'i', guard.MIGRATOR_ROLE),
+        ('public', 'intake_requests_tenant_idx', 'i', guard.MIGRATOR_ROLE),
     ]
     guard.require(relations(connection) == expected, 'Unexpected schema inventory')
 
@@ -90,13 +97,14 @@ def isolated_schema(target):
         try:
             connection.rollback()
             if created:
-                expected_names = {'intake_requests', 'intake_requests_id_seq', 'intake_requests_pkey'}
+                expected_names = {'companies','companies_pkey','companies_credential_digest_key','intake_requests','intake_requests_id_seq','intake_requests_pkey','intake_requests_tenant_idx'}
                 inventory = relations(connection)
-                guard.require(len(inventory) == 3 and all(
+                guard.require(len(inventory) == 7 and all(
                     row[0] == 'public' and row[1] in expected_names
                     and row[3] == guard.MIGRATOR_ROLE for row in inventory
                 ), 'Cleanup inventory mismatch')
                 guard.query(connection, 'DROP TABLE public.intake_requests')
+                guard.query(connection, 'DROP TABLE public.companies')
                 guard.require(not relations(connection), 'Cleanup left application relations')
                 connection.commit()
         except Exception:

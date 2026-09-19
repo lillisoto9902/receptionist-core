@@ -6,11 +6,17 @@ from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
-from app import main
+from app import main, companies
+from company_fixture import configuration
 
 
 class SchedulingFixture(unittest.TestCase):
     def setUp(self):
+        marker = companies.context.set({'tenant_id': 'synthetic-a', 'configuration': configuration()})
+        self.addCleanup(companies.context.reset, marker)
+        previous = main.app.dependency_overrides.copy()
+        main.app.dependency_overrides[companies.require_tenant] = lambda: companies.current()
+        self.addCleanup(lambda: (main.app.dependency_overrides.clear(), main.app.dependency_overrides.update(previous)))
         self.now = datetime(2030, 1, 2, 6, tzinfo=timezone.utc)
         self.enterContext(patch.object(main, "get_business_now", return_value=self.now))
         self.enterContext(patch.object(main, "get_business_timezone", return_value=timezone.utc))
@@ -80,14 +86,14 @@ class BookingLookupTests(SchedulingFixture):
         for value in (None, "", "string", "nonsense", "25:00", "09:60", "-1:00",
                       "09:00:garbage", "invalidT09:00", "2030-02-30T09:00"):
             with self.subTest(value=value):
-                self.cursor.fetchall.return_value = [("10:00", 30), (value, 30)]
+                self.cursor.fetchall.return_value = [(self.now.replace(hour=10), 30), (value, 30)]
                 with self.assertRaises(main.SchedulingDataError):
                     main.get_active_bookings()
 
     def test_invalid_stored_durations_fail_whole_lookup(self):
         for value in (None, 0, -1, "bad", "30", 30.5, True, float("inf")):
             with self.subTest(value=value):
-                self.cursor.fetchall.return_value = [("09:00", value)]
+                self.cursor.fetchall.return_value = [(self.now.replace(hour=9), value)]
                 with self.assertRaises(main.SchedulingDataError):
                     main.get_active_bookings()
 
@@ -99,13 +105,14 @@ class BookingLookupTests(SchedulingFixture):
                     main.get_active_bookings()
 
     def test_valid_rows_preserve_normalization_and_reserving_query(self):
-        self.cursor.fetchall.return_value = [("2030-01-02T10:00:00", 30), ("9:00", 60)]
-        self.assertEqual(main.get_active_bookings(), [("10:00", 30), ("9:00", 60)])
+        self.cursor.fetchall.return_value = [(self.now.replace(hour=10), 30), (self.now.replace(hour=9), 60)]
+        self.assertEqual(main.get_active_bookings(), [(self.now.replace(hour=10), 30), (self.now.replace(hour=9), 60)])
         self.assertEqual(self.cursor.execute.call_args.args[0], """
-            SELECT scheduled_time, duration_minutes
+            SELECT scheduled_at, duration_minutes
             FROM intake_requests
-            WHERE scheduled_time IS NOT NULL
-              AND appointment_status IN ('scheduled', 'pending', 'needs_confirmation')
+            WHERE tenant_id = %s
+              AND (%s IS NULL OR id <> %s)
+              AND appointment_status IN ('scheduled', 'pending', 'needs_confirmation', 'confirmed')
         """)
 
     def test_integrity_exception_propagates_through_all_evaluators(self):
@@ -179,7 +186,7 @@ class EligibilityTests(SchedulingFixture):
         self.assertFalse(main.times_overlap("09:30", 30, "09:00", 30))
 
     def test_conflicts_remain_unavailable(self):
-        self.cursor.fetchall.return_value = [("10:00", 60)]
+        self.cursor.fetchall.return_value = [(self.now.replace(hour=10), 60)]
         for start, duration in (("10:00", 30), ("09:30", 60), ("10:30", 60)):
             self.assertFalse(main.is_slot_available(start, duration))
         self.assertTrue(main.is_slot_available("09:30", 30))

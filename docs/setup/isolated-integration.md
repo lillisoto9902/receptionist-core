@@ -33,15 +33,15 @@ operator preflight. The harness never starts/stops the server or changes grants.
 `isolated_schema` requires no application objects and uses only the migrator.
 It reuses the existing initializer twice inside a harness-owned transaction,
 suppresses its raw error output, verifies the resulting inventory, then commits
-the table `public.intake_requests`, its serial sequence and primary-key index.
+the tables `public.companies` and `public.intake_requests`, their indexes, and the intake serial sequence.
 The application role uses only the established table CRUD and sequence grants.
 It receives no ownership, CREATE, TEMP, membership or elevated role capability.
 
 Runtime validation uses synthetic rows with transaction rollback. It exercises
-the current scheduling read path, CRUD, and denied CREATE/TEMP/ALTER. No fixture
-is committed. After closing runtime connections, teardown uses the same migrator
-to drop only the newly created table without CASCADE, removing its owned sequence
-and index. It refuses unexpected inventories and never clears an existing schema.
+the current scheduling read path, CRUD, and denied CREATE/TEMP/ALTER. The schema-only test rolls back its fixture. The Phase 14 workflow test commits
+synthetic companies/intakes to prove persistence; teardown removes them. After closing runtime connections, teardown uses the same migrator
+to drop only the newly created intake table and then company table without CASCADE,
+removing their owned sequence and indexes. It refuses unexpected inventories and never clears an existing schema.
 The expected final database is empty again. This lifecycle requires exclusive use;
 it is not a parallel-test harness. A failed cleanup requires safe follow-up, not
 broad cleanup or another run. An interrupted controller may leave the committed

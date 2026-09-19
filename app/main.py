@@ -1,9 +1,11 @@
 import os
 import secrets
 import psycopg2
-from contextlib import closing
-from datetime import datetime, time, timedelta
+from contextlib import closing, nullcontext
+from datetime import datetime, time, timedelta, timezone
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.exceptions import RequestValidationError
+from app import companies
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Optional
@@ -15,6 +17,10 @@ app = FastAPI(
     description="A modular digital receptionist engine for intake, scheduling, and client communication.",
     version="0.1.0",
 )
+
+
+class SchedulingConflict(Exception):
+    """A reservation conflicts with an existing appointment."""
 
 
 class SchedulingDataError(Exception):
@@ -84,7 +90,7 @@ BUSINESS_SETTINGS = {
 
 
 def get_business_setting(setting_name, default=None):
-    return BUSINESS_SETTINGS.get(setting_name, default)
+    return companies.current()['configuration'].get(setting_name, default)
 
 
 def determine_initial_booking_status():
@@ -195,21 +201,32 @@ def parse_requested_datetime(value, now=None):
     try:
         parsed_datetime = datetime.fromisoformat(requested_value.replace("Z", "+00:00"))
         if parsed_datetime.tzinfo is None:
-            return parsed_datetime.replace(tzinfo=timezone)
+            local = parsed_datetime.replace(tzinfo=timezone)
+            if datetime.fromtimestamp(local.timestamp(), timezone).replace(tzinfo=None) != parsed_datetime:
+                return None
+            return local
         return parsed_datetime.astimezone(timezone)
     except ValueError:
-        pass
+        if "T" in requested_value or " " in requested_value:
+            return None
 
+    try:
+        parsed_time = time.fromisoformat(requested_value if len(requested_value.split(':')[0]) == 2 else '0' + requested_value)
+    except ValueError:
+        return None
     normalized_time = normalize_time_value(requested_value)
     if normalized_time is None or ":" not in normalized_time:
         return None
 
     try:
         hour, minute = map(int, normalized_time.split(":"))
-        return datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone).replace(
+        candidate = datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone).replace(
             hour=hour,
-            minute=minute,
+            minute=minute, second=parsed_time.second, microsecond=parsed_time.microsecond,
         )
+        if datetime.fromtimestamp(candidate.timestamp(), timezone).replace(tzinfo=None) != candidate.replace(tzinfo=None):
+            return None
+        return candidate
     except (TypeError, ValueError):
         return None
 
@@ -218,7 +235,8 @@ def is_valid_preferred_time(value):
     if value is None:
         return True
 
-    return parse_requested_datetime(value) is not None
+    parsed = parse_requested_datetime(value)
+    return parsed is not None and parsed.second == 0 and parsed.microsecond == 0
 
 
 def invalid_preferred_time_response(service_type, service):
@@ -282,11 +300,12 @@ def get_slot_datetime(slot_time, reference_time=None):
     except (TypeError, ValueError):
         return None
 
-    return datetime.combine(
-        reference_datetime.date(),
-        datetime.min.time(),
-        tzinfo=get_business_timezone(),
-    ).replace(hour=hour, minute=minute)
+    candidate = reference_datetime.astimezone(get_business_timezone()).replace(
+        hour=hour, minute=minute, second=0, microsecond=0,
+    )
+    if datetime.fromtimestamp(candidate.timestamp(), get_business_timezone()).replace(tzinfo=None) != candidate.replace(tzinfo=None):
+        return None
+    return candidate
 
 
 def slot_passes_booking_window(slot_time, reference_time=None):
@@ -353,21 +372,22 @@ def add_minutes(time_string: str, minutes: int):
 
 def generate_time_slots():
     slots = []
-    start_minutes = 9 * 60
-    end_minutes = 16 * 60 + 30
+    start_minutes = time_to_minutes(get_business_setting('opening'))
+    end_minutes = time_to_minutes(get_business_setting('closing')) - 1
     current = start_minutes
     while current <= end_minutes:
         slots.append(minutes_to_time(current))
-        current += 30
+        current += get_business_setting('interval_minutes')
     return slots
 
 
 def time_fits(start_time: str, duration_minutes: int):
     start_minutes = time_to_minutes(start_time)
     return (
-        9 * 60 <= start_minutes
-        and start_minutes % 30 == 0
-        and start_minutes + duration_minutes <= 17 * 60
+        time_to_minutes(get_business_setting('opening')) <= start_minutes
+        and (start_minutes - time_to_minutes(get_business_setting('opening'))) % get_business_setting('interval_minutes') == 0
+        and type(duration_minutes) is int and duration_minutes > 0
+        and start_minutes + duration_minutes <= time_to_minutes(get_business_setting('closing'))
     )
 
 
@@ -388,37 +408,28 @@ def times_overlap(start_a: str, duration_a: int, start_b: str, duration_b: int):
     return start_a_minutes < end_b_minutes and end_a_minutes > start_b_minutes
 
 
-def get_active_bookings():
+def get_active_bookings(reference_time=None, connection=None, exclude_id=None):
     try:
-        with closing(get_db_connection()) as conn, closing(conn.cursor()) as cursor:
+        with (nullcontext(connection) if connection is not None else closing(get_db_connection())) as conn, closing(conn.cursor()) as cursor:
             cursor.execute("""
-            SELECT scheduled_time, duration_minutes
+            SELECT scheduled_at, duration_minutes
             FROM intake_requests
-            WHERE scheduled_time IS NOT NULL
-              AND appointment_status IN ('scheduled', 'pending', 'needs_confirmation')
-        """)
+            WHERE tenant_id = %s
+              AND (%s IS NULL OR id <> %s)
+              AND appointment_status IN ('scheduled', 'pending', 'needs_confirmation', 'confirmed')
+        """, (companies.tenant_id(), exclude_id, exclude_id))
             rows = cursor.fetchall()
         bookings = []
         for row in rows:
             if not isinstance(row, (tuple, list)) or len(row) != 2:
                 raise SchedulingDataError()
-            if not isinstance(row[0], str):
+            scheduled_at, duration_minutes = row
+            if not isinstance(scheduled_at, datetime) or scheduled_at.tzinfo is None or scheduled_at.utcoffset() is None:
                 raise SchedulingDataError()
-            raw_time = row[0].strip()
-            if "T" in raw_time:
-                datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
-            elif len(raw_time.split(":")) > 2:
-                time.fromisoformat(raw_time)
-            scheduled_time = normalize_time_value(row[0])
-            duration_minutes = row[1]
-            if scheduled_time is None:
-                raise SchedulingDataError()
-            hour, minute = map(int, scheduled_time.split(":"))
-            if not (0 <= hour < 24 and 0 <= minute < 60):
-                raise SchedulingDataError()
+            scheduled_at = scheduled_at.astimezone(timezone.utc)
             if type(duration_minutes) is not int or duration_minutes <= 0:
                 raise SchedulingDataError()
-            bookings.append((scheduled_time, duration_minutes))
+            bookings.append((scheduled_at, duration_minutes))
         return bookings
     except SchedulingDataError:
         raise
@@ -426,12 +437,18 @@ def get_active_bookings():
         raise SchedulingDataError() from None
 
 
-def is_slot_available(start_time: str, duration_minutes: int):
+def is_slot_available(start_time: str, duration_minutes: int, reference_time=None, connection=None, exclude_id=None):
     if not time_fits(start_time, duration_minutes):
         return False
 
-    for booking_time, booking_duration in get_active_bookings():
-        if times_overlap(start_time, duration_minutes, booking_time, booking_duration):
+    requested_start = get_slot_datetime(start_time, reference_time)
+    if requested_start is None:
+        return False
+    requested_start = requested_start.astimezone(timezone.utc)
+    requested_end = requested_start + timedelta(minutes=duration_minutes)
+    for booking_start, booking_duration in get_active_bookings(reference_time, connection, exclude_id):
+        booking_end = booking_start + timedelta(minutes=booking_duration)
+        if requested_start < booking_end and booking_start < requested_end:
             return False
     return True
 
@@ -441,11 +458,11 @@ def find_next_available_slot(duration_minutes: int, preferred_time: Optional[str
 
     if preferred_time:
         raw_preferred_time = preferred_time
-        preferred_time = normalize_time_value(preferred_time)
+        preferred_time = parse_requested_datetime(preferred_time).strftime("%H:%M")
         if (
             preferred_time in slots
             and slot_passes_booking_window(preferred_time, raw_preferred_time)
-            and is_slot_available(preferred_time, duration_minutes)
+            and is_slot_available(preferred_time, duration_minutes, raw_preferred_time)
         ):
             return preferred_time
         preferred_minutes = time_to_minutes(preferred_time)
@@ -453,7 +470,7 @@ def find_next_available_slot(duration_minutes: int, preferred_time: Optional[str
             if (
                 time_to_minutes(slot) > preferred_minutes
                 and slot_passes_booking_window(slot, raw_preferred_time)
-                and is_slot_available(slot, duration_minutes)
+                and is_slot_available(slot, duration_minutes, raw_preferred_time)
             ):
                 return slot
         return None
@@ -471,7 +488,7 @@ def find_available_options(duration_minutes: int, preferred_time: Optional[str] 
 
     if preferred_time:
         raw_preferred_time = preferred_time
-        preferred_time = normalize_time_value(preferred_time)
+        preferred_time = parse_requested_datetime(preferred_time).strftime("%H:%M")
         preferred_minutes = time_to_minutes(preferred_time)
 
         for slot in slots:
@@ -479,7 +496,7 @@ def find_available_options(duration_minutes: int, preferred_time: Optional[str] 
                 if (
                     time_to_minutes(slot) >= preferred_minutes
                     and slot_passes_booking_window(slot, raw_preferred_time)
-                    and is_slot_available(slot, duration_minutes)
+                    and is_slot_available(slot, duration_minutes, raw_preferred_time)
                 ):
                     options.append({
                         "time": slot,
@@ -506,20 +523,15 @@ def find_available_options(duration_minutes: int, preferred_time: Optional[str] 
 
 
 def detect_service(reason: str):
-    normalized = (reason or "").lower()
-    if "lash" in normalized and "fill" in normalized:
-        return "lash_fill"
-    if "lash" in normalized:
-        return "full_set_lashes"
-    if any(keyword in normalized for keyword in ("color", "dye", "highlight")):
-        return "coloring"
-    if any(keyword in normalized for keyword in ("style", "blowout", "updo")):
-        return "styling"
-    if any(keyword in normalized for keyword in ("treatment", "deep condition", "keratin")):
-        return "treatment"
-    if any(keyword in normalized for keyword in ("cut", "trim", "haircut")):
-        return "haircut"
-    return "consultation"
+    normalized = (reason or '').strip().lower()
+    services = get_business_setting('services')
+    if normalized in services:
+        return normalized
+    matched = [name for name, service in services.items()
+               if any(keyword in normalized for keyword in service['keywords'])]
+    if len(matched) != 1:
+        raise HTTPException(422, 'Invalid service')
+    return matched[0]
 
 
 def get_db_connection():
@@ -541,8 +553,17 @@ def init_db():
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("""
+            CREATE TABLE IF NOT EXISTS companies (
+                tenant_id TEXT PRIMARY KEY CHECK (tenant_id ~ '^[a-z][a-z0-9-]{0,62}$'),
+                configuration JSONB NOT NULL,
+                credential_digest TEXT NOT NULL UNIQUE CHECK (length(credential_digest)=64)
+            )
+        """)
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS intake_requests (
                 id SERIAL PRIMARY KEY,
+                tenant_id TEXT NOT NULL REFERENCES companies(tenant_id),
+                scheduled_at TIMESTAMPTZ NOT NULL,
                 name TEXT NOT NULL,
                 phone TEXT NOT NULL,
                 email TEXT,
@@ -562,16 +583,24 @@ def init_db():
         cursor.execute("ALTER TABLE intake_requests ADD COLUMN IF NOT EXISTS industry TEXT")
         cursor.execute("ALTER TABLE intake_requests ADD COLUMN IF NOT EXISTS duration_minutes INTEGER")
         cursor.execute("ALTER TABLE intake_requests ADD COLUMN IF NOT EXISTS priority TEXT")
+        cursor.execute("ALTER TABLE intake_requests ADD COLUMN IF NOT EXISTS tenant_id TEXT REFERENCES companies(tenant_id)")
+        cursor.execute("ALTER TABLE intake_requests ALTER COLUMN tenant_id SET NOT NULL")
+        cursor.execute("ALTER TABLE intake_requests ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ")
+        cursor.execute("ALTER TABLE intake_requests ALTER COLUMN scheduled_at SET NOT NULL")
+        cursor.execute("CREATE INDEX IF NOT EXISTS intake_requests_tenant_idx ON intake_requests(tenant_id)")
         conn.commit()
         cursor.close()
         conn.close()
-    except Exception as e:
-        print(f"Failed to initialize database: {e}")
+    except Exception:
+        if 'conn' in locals():
+            conn.rollback()
+            conn.close()
+        raise RuntimeError('Database initialization failed') from None
 
 
-@app.on_event("startup")
-async def startup():
-    init_db()
+@app.exception_handler(RequestValidationError)
+async def invalid_request_handler(request, exc):
+    return JSONResponse(status_code=422, content={'detail': 'Invalid request'})
 
 
 def record_from_tuple(row):
@@ -599,17 +628,15 @@ def fetch_intakes_by_field(field_name, value):
     if field_name not in ALLOWED_INTAKE_FILTER_FIELDS:
         raise ValueError("Invalid intake filter field")
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(f"""
-        SELECT id, name, phone, email, reason, preferred_time, source, scheduled_time, appointment_status, service_type, industry, duration_minutes, priority, created_at
-        FROM intake_requests
-        WHERE {field_name} = %s
-        ORDER BY created_at DESC
-    """, (value,))
-    rows = cursor.fetchall()
-    cursor.close()
-    conn.close()
+    with closing(get_db_connection()) as conn, closing(conn.cursor()) as cursor:
+        cursor.execute(f"""
+            SELECT id, name, phone, email, reason, preferred_time, source, scheduled_time, appointment_status, service_type, industry, duration_minutes, priority, created_at
+            FROM intake_requests
+            WHERE tenant_id = %s AND {field_name} = %s
+            ORDER BY created_at DESC
+        """, (companies.tenant_id(), value))
+        rows = cursor.fetchall()
+
 
     return [record_from_tuple(row) for row in rows]
 
@@ -659,59 +686,58 @@ def health_check():
 
 
 @app.get("/settings")
-def get_settings(admin_auth: bool = Depends(require_admin_auth)):
+def get_settings(admin_auth: bool = Depends(companies.require_tenant)):
     return {
         "status": "ok",
-        "settings": BUSINESS_SETTINGS,
+        "settings": companies.current()["configuration"],
     }
 
 
 @app.get("/dashboard/stats")
-def dashboard_stats(admin_auth: bool = Depends(require_admin_auth)):
+def dashboard_stats(admin_auth: bool = Depends(companies.require_tenant)):
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        with closing(get_db_connection()) as conn, closing(conn.cursor()) as cursor:
 
-        cursor.execute("SELECT COUNT(*) FROM intake_requests")
-        total_intakes = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM intake_requests WHERE tenant_id = %s", (companies.tenant_id(),))
+            total_intakes = cursor.fetchone()[0]
 
-        by_status = {
-            status: 0
-            for status in VALID_APPOINTMENT_STATUSES
-        }
-        cursor.execute("""
-            SELECT appointment_status, COUNT(*)
-            FROM intake_requests
-            GROUP BY appointment_status
-        """)
-        for status, count in cursor.fetchall():
-            if status in by_status:
-                by_status[status] = count
+            by_status = {
+                status: 0
+                for status in VALID_APPOINTMENT_STATUSES
+            }
+            cursor.execute("""
+                SELECT appointment_status, COUNT(*)
+                FROM intake_requests
+                WHERE tenant_id = %s
+                GROUP BY appointment_status
+            """, (companies.tenant_id(),))
+            for status, count in cursor.fetchall():
+                if status in by_status:
+                    by_status[status] = count
 
-        cursor.execute("""
-            SELECT service_type, COUNT(*)
-            FROM intake_requests
-            WHERE service_type IS NOT NULL
-            GROUP BY service_type
-        """)
-        by_service_type = {
-            service_type: count
-            for service_type, count in cursor.fetchall()
-        }
+            cursor.execute("""
+                SELECT service_type, COUNT(*)
+                FROM intake_requests
+                WHERE tenant_id = %s AND service_type IS NOT NULL
+                GROUP BY service_type
+            """, (companies.tenant_id(),))
+            by_service_type = {
+                service_type: count
+                for service_type, count in cursor.fetchall()
+            }
 
-        cursor.execute("""
-            SELECT priority, COUNT(*)
-            FROM intake_requests
-            WHERE priority IS NOT NULL
-            GROUP BY priority
-        """)
-        by_priority = {
-            priority: count
-            for priority, count in cursor.fetchall()
-        }
+            cursor.execute("""
+                SELECT priority, COUNT(*)
+                FROM intake_requests
+                WHERE tenant_id = %s AND priority IS NOT NULL
+                GROUP BY priority
+            """, (companies.tenant_id(),))
+            by_priority = {
+                priority: count
+                for priority, count in cursor.fetchall()
+            }
 
-        cursor.close()
-        conn.close()
+
 
         return {
             "status": "ok",
@@ -1098,16 +1124,19 @@ def admin_dashboard_demo():
     """
 
 
-@app.post("/intake")
+@app.post("/intake", dependencies=[Depends(companies.require_tenant)])
 def create_intake(request: IntakeRequest):
     service_type = detect_service(request.reason)
-    service = SERVICES.get(service_type, SERVICES["consultation"])
+    service = get_business_setting('services')[service_type]
     duration_minutes = service["duration_minutes"]
 
     if not is_valid_preferred_time(request.preferred_time):
         return invalid_preferred_time_response(service_type, service)
 
-    preferred_time = normalize_time_value(request.preferred_time)
+    requested_at = parse_requested_datetime(request.preferred_time)
+    if requested_at is not None and (requested_at.second or requested_at.microsecond):
+        return invalid_preferred_time_response(service_type, service)
+    preferred_time = requested_at.strftime("%H:%M") if requested_at else None
 
     if preferred_time is None:
         options = find_available_options(duration_minutes)
@@ -1140,7 +1169,7 @@ def create_intake(request: IntakeRequest):
         }
 
     try:
-        preferred_time_available = is_slot_available(preferred_time, duration_minutes)
+        preferred_time_available = is_slot_available(preferred_time, duration_minutes, request.preferred_time)
     except (TypeError, ValueError):
         preferred_time_available = False
 
@@ -1158,23 +1187,30 @@ def create_intake(request: IntakeRequest):
             "available_options": options,
         }
 
-    scheduled_time = preferred_time
+    scheduled_time = requested_at.isoformat()
     appointment_status = determine_initial_appointment_status() if scheduled_time else "pending"
 
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO intake_requests 
-            (name, phone, email, reason, preferred_time, source, scheduled_time, appointment_status, service_type, industry, duration_minutes, priority)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING id, name, phone, email, reason, preferred_time, source, scheduled_time, appointment_status, service_type, industry, duration_minutes, priority, created_at
-        """, (request.name, request.phone, request.email, request.reason, preferred_time, 
-              request.source, scheduled_time, appointment_status, service_type, service["industry"], service["duration_minutes"], service["priority"]))
-        row = cursor.fetchone()
-        conn.commit()
-        cursor.close()
-        conn.close()
+        with closing(get_db_connection()) as conn, closing(conn.cursor()) as cursor:
+            cursor.execute("SET LOCAL lock_timeout = '10s'")
+            cursor.execute("SELECT tenant_id FROM companies WHERE tenant_id = %s FOR UPDATE", (companies.tenant_id(),))
+            if cursor.fetchone() is None:
+                raise SchedulingDataError()
+            if not is_slot_available(preferred_time, duration_minutes, scheduled_time, conn):
+                conn.rollback()
+                return {'status': 'slot_unavailable', 'service_type': service_type,
+                        'industry': service['industry'], 'duration_minutes': duration_minutes,
+                        'priority': service['priority'], 'available_options': []}
+            cursor.execute("""
+                INSERT INTO intake_requests
+                (name, phone, email, reason, preferred_time, source, scheduled_time, appointment_status, service_type, industry, duration_minutes, priority, tenant_id, scheduled_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id, name, phone, email, reason, preferred_time, source, scheduled_time, appointment_status, service_type, industry, duration_minutes, priority, created_at
+            """, (request.name, request.phone, request.email, request.reason, scheduled_time,
+                  request.source, scheduled_time, appointment_status, service_type, service["industry"], service["duration_minutes"], service["priority"], companies.tenant_id(), requested_at))
+            row = cursor.fetchone()
+            conn.commit()
+
         
         record = record_from_tuple(row)
 
@@ -1182,7 +1218,7 @@ def create_intake(request: IntakeRequest):
             status = "no_availability"
             scheduling_note = "no_availability"
         elif preferred_time:
-            if scheduled_time == preferred_time:
+            if requested_at is not None:
                 status = appointment_status
                 scheduling_note = "preferred_time_confirmed"
             else:
@@ -1204,6 +1240,8 @@ def create_intake(request: IntakeRequest):
             "deposit_decision": build_deposit_decision(),
             "data": record,
         }
+    except SchedulingDataError:
+        raise
     except Exception:
         return {
             "status": "error",
@@ -1215,10 +1253,10 @@ def create_intake(request: IntakeRequest):
         }
 
 
-@app.post("/availability")
+@app.post("/availability", dependencies=[Depends(companies.require_tenant)])
 def get_availability(request: AvailabilityRequest):
     service_type = detect_service(request.reason)
-    service = SERVICES.get(service_type, SERVICES["consultation"])
+    service = get_business_setting('services')[service_type]
 
     if not is_valid_preferred_time(request.preferred_time):
         return invalid_preferred_time_response(service_type, service)
@@ -1261,18 +1299,17 @@ def get_availability(request: AvailabilityRequest):
 
 
 @app.get("/intakes")
-def list_intakes(admin_auth: bool = Depends(require_admin_auth)):
+def list_intakes(admin_auth: bool = Depends(companies.require_tenant)):
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT id, name, phone, email, reason, preferred_time, source, scheduled_time, appointment_status, service_type, industry, duration_minutes, priority, created_at
-            FROM intake_requests
-            ORDER BY created_at DESC
-        """)
-        rows = cursor.fetchall()
-        cursor.close()
-        conn.close()
+        with closing(get_db_connection()) as conn, closing(conn.cursor()) as cursor:
+            cursor.execute("""
+                SELECT id, name, phone, email, reason, preferred_time, source, scheduled_time, appointment_status, service_type, industry, duration_minutes, priority, created_at
+                FROM intake_requests
+                WHERE tenant_id = %s
+                ORDER BY created_at DESC
+            """, (companies.tenant_id(),))
+            rows = cursor.fetchall()
+
         
         records = [record_from_tuple(row) for row in rows]
         return {
@@ -1288,7 +1325,7 @@ def list_intakes(admin_auth: bool = Depends(require_admin_auth)):
 
 
 @app.get("/intakes/status/{status}")
-def list_intakes_by_status(status: str, admin_auth: bool = Depends(require_admin_auth)):
+def list_intakes_by_status(status: str, admin_auth: bool = Depends(companies.require_tenant)):
     if status not in VALID_APPOINTMENT_STATUSES:
         return {
             "status": "error",
@@ -1312,7 +1349,7 @@ def list_intakes_by_status(status: str, admin_auth: bool = Depends(require_admin
 
 
 @app.get("/intakes/service/{service_type}")
-def list_intakes_by_service(service_type: str, admin_auth: bool = Depends(require_admin_auth)):
+def list_intakes_by_service(service_type: str, admin_auth: bool = Depends(companies.require_tenant)):
     try:
         records = fetch_intakes_by_field("service_type", service_type)
         return {
@@ -1330,7 +1367,7 @@ def list_intakes_by_service(service_type: str, admin_auth: bool = Depends(requir
 
 
 @app.get("/intakes/priority/{priority}")
-def list_intakes_by_priority(priority: str, admin_auth: bool = Depends(require_admin_auth)):
+def list_intakes_by_priority(priority: str, admin_auth: bool = Depends(companies.require_tenant)):
     try:
         records = fetch_intakes_by_field("priority", priority)
         return {
@@ -1348,18 +1385,16 @@ def list_intakes_by_priority(priority: str, admin_auth: bool = Depends(require_a
 
 
 @app.get("/intakes/{request_id}")
-def get_intake(request_id: int, admin_auth: bool = Depends(require_admin_auth)):
+def get_intake(request_id: int, admin_auth: bool = Depends(companies.require_tenant)):
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT id, name, phone, email, reason, preferred_time, source, scheduled_time, appointment_status, service_type, industry, duration_minutes, priority, created_at
-            FROM intake_requests
-            WHERE id = %s
-        """, (request_id,))
-        row = cursor.fetchone()
-        cursor.close()
-        conn.close()
+        with closing(get_db_connection()) as conn, closing(conn.cursor()) as cursor:
+            cursor.execute("""
+                SELECT id, name, phone, email, reason, preferred_time, source, scheduled_time, appointment_status, service_type, industry, duration_minutes, priority, created_at
+                FROM intake_requests
+                WHERE id = %s AND tenant_id = %s
+            """, (request_id, companies.tenant_id()))
+            row = cursor.fetchone()
+
         
         if row:
             record = record_from_tuple(row)
@@ -1379,39 +1414,45 @@ def get_intake(request_id: int, admin_auth: bool = Depends(require_admin_auth)):
 
 
 def update_intake_status(request_id, status):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE intake_requests
-        SET appointment_status = %s
-        WHERE id = %s
-        RETURNING id, name, phone, email, reason, preferred_time, source, scheduled_time, appointment_status, service_type, industry, duration_minutes, priority, created_at
-    """, (status, request_id))
-    row = cursor.fetchone()
-    conn.commit()
-    cursor.close()
-    conn.close()
+    with closing(get_db_connection()) as conn, closing(conn.cursor()) as cursor:
+        cursor.execute("SET LOCAL lock_timeout = '10s'")
+        cursor.execute("SELECT tenant_id FROM companies WHERE tenant_id=%s FOR UPDATE", (companies.tenant_id(),))
+        if cursor.fetchone() is None:
+            raise SchedulingDataError()
+        cursor.execute("SELECT scheduled_at,duration_minutes FROM intake_requests WHERE id=%s AND tenant_id=%s", (request_id,companies.tenant_id()))
+        existing = cursor.fetchone()
+        if existing and status in ('scheduled','pending','needs_confirmation','confirmed'):
+            requested = existing[0].astimezone(get_business_timezone())
+            if not is_slot_available(requested.strftime('%H:%M'),existing[1],requested.isoformat(),conn,request_id):
+                raise SchedulingConflict()
+        cursor.execute("""
+            UPDATE intake_requests
+            SET appointment_status = %s
+            WHERE id = %s AND tenant_id = %s
+            RETURNING id, name, phone, email, reason, preferred_time, source, scheduled_time, appointment_status, service_type, industry, duration_minutes, priority, created_at
+        """, (status, request_id, companies.tenant_id()))
+        row = cursor.fetchone()
+        conn.commit()
+
 
     return record_from_tuple(row)
 
 
 def fetch_intake_by_id(request_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id, name, phone, email, reason, preferred_time, source, scheduled_time, appointment_status, service_type, industry, duration_minutes, priority, created_at
-        FROM intake_requests
-        WHERE id = %s
-    """, (request_id,))
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
+    with closing(get_db_connection()) as conn, closing(conn.cursor()) as cursor:
+        cursor.execute("""
+            SELECT id, name, phone, email, reason, preferred_time, source, scheduled_time, appointment_status, service_type, industry, duration_minutes, priority, created_at
+            FROM intake_requests
+            WHERE id = %s AND tenant_id = %s
+        """, (request_id, companies.tenant_id()))
+        row = cursor.fetchone()
+
 
     return record_from_tuple(row)
 
 
 @app.put("/intakes/{request_id}/status")
-def update_intake_status_endpoint(request_id: int, update: StatusUpdate, admin_auth: bool = Depends(require_admin_auth)):
+def update_intake_status_endpoint(request_id: int, update: StatusUpdate, admin_auth: bool = Depends(companies.require_tenant)):
     if update.appointment_status not in VALID_APPOINTMENT_STATUSES:
         return {
             "status": "error",
@@ -1444,6 +1485,8 @@ def update_intake_status_endpoint(request_id: int, update: StatusUpdate, admin_a
             "status": "not_found",
             "message": "Intake request not found",
         }
+    except SchedulingConflict:
+        return {'status':'slot_unavailable','message':'Appointment slot unavailable'}
     except Exception:
         return {
             "status": "error",
@@ -1452,19 +1495,17 @@ def update_intake_status_endpoint(request_id: int, update: StatusUpdate, admin_a
 
 
 @app.delete("/intakes/{request_id}")
-def delete_intake(request_id: int, admin_auth: bool = Depends(require_admin_auth)):
+def delete_intake(request_id: int, admin_auth: bool = Depends(companies.require_tenant)):
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            DELETE FROM intake_requests
-            WHERE id = %s
-            RETURNING id
-        """, (request_id,))
-        row = cursor.fetchone()
-        conn.commit()
-        cursor.close()
-        conn.close()
+        with closing(get_db_connection()) as conn, closing(conn.cursor()) as cursor:
+            cursor.execute("""
+                DELETE FROM intake_requests
+                WHERE id = %s AND tenant_id = %s
+                RETURNING id
+            """, (request_id, companies.tenant_id()))
+            row = cursor.fetchone()
+            conn.commit()
+
         
         if row:
             return {
@@ -1481,3 +1522,28 @@ def delete_intake(request_id: int, admin_auth: bool = Depends(require_admin_auth
             "status": "error",
             "message": "Failed to delete intake",
         }
+
+
+@app.post('/platform/companies/{tenant_id}')
+def provision_company(tenant_id: str, config: companies.CompanyConfig,
+                      admin=Depends(require_admin_auth)):
+    return companies.provision(tenant_id, config)
+
+
+@app.put('/platform/companies/{tenant_id}')
+def configure_company(tenant_id: str, config: companies.CompanyConfig,
+                      admin=Depends(require_admin_auth)):
+    return companies.configure(tenant_id, config)
+
+
+@app.get('/companies/{tenant_id}')
+def company_configuration(tenant_id: str, tenant=Depends(companies.require_tenant)):
+    return tenant
+
+
+@app.put('/companies/{tenant_id}')
+def update_company_configuration(tenant_id: str, config: companies.CompanyConfig,
+                                 tenant=Depends(companies.require_tenant)):
+    if not config.active:
+        raise HTTPException(403, 'Forbidden')
+    return companies.configure(tenant['tenant_id'], config)
